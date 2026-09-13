@@ -22,6 +22,7 @@ const NEZHA_KEY = process.env.NEZHA_KEY || '';              // 哪吒v1的NZ_CLI
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'cdn.cbcb.kdns.fr';          // 固定隧道域名,留空即启用临时隧道
 const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiNjIyMDdiNDVhZTA4ZWQ3M2ZlNzkwNWFmOTY1MjBmZjgiLCJ0IjoiMDAyYWJjNmItMmZmNi00NTI3LWIxYmItM2UwZDZlMmRmNzA2IiwicyI6Ik56TTNaVFV5WXpJdFlXTXpNQzAwTm1ZekxUbGtOVEF0WTJGalptVTFNbUUzWW1VMiJ9';              // 固定隧道密钥json或token,留空即启用临时隧道,json获取地址：https://json.zone.id
 const ARGO_PORT = process.env.ARGO_PORT || 8001;            // 固定隧道端口,使用token需在cloudflare后台设置和这里一致
+const ARGO_PROTOCOL = process.env.ARGO_PROTOCOL || 'quic';  // 隧道协议: quic 多流无队头阻塞吞吐最高(YouTube/下载收益最大); 被墙或UDP受限时改回 http2
 const CFIP = process.env.CFIP || 'saas.sin.fan';            // 节点优选域名或优选ip
 const CFPORT = process.env.CFPORT || 443;                   // 节点优选域名或优选ip对应的端口
 const NAME = process.env.NAME || '';                        // 节点名称
@@ -103,20 +104,50 @@ async function cleanupOldFiles() {
 }
 
 // 生成xray配置文件
+// 性能要点：
+// 1. DNS 从 DoH(https+local://8.8.8.8) 改为 UDP + 内置缓存 —— 原来每个新域名都要对 8.8.8.8 做一次 TLS 握手（300ms+），
+//    YouTube 每个分段、下载器每个线程都要建连，这是码率/多线程的第一大瓶颈
+// 2. 关掉全部 sniffing —— outbounds 只有 freedom 直连、没有 routing 规则，嗅探纯属白烧 CPU
+// 3. policy 显式大缓冲 + 关闭流量统计 —— 高吞吐时每连接 1MB 缓冲，统计写盘全部停掉
 async function generateConfig() {
   const config = {
     log: { access: '/dev/null', error: '/dev/null', loglevel: 'none' },
     inbounds: [
       { port: ARGO_PORT, protocol: 'vless', settings: { clients: [{ id: UUID, flow: 'xtls-rprx-vision' }], decryption: 'none', fallbacks: [{ dest: 3001 }, { path: "/vless-argo", dest: 3002 }, { path: "/vmess-argo", dest: 3003 }, { path: "/trojan-argo", dest: 3004 }] }, streamSettings: { network: 'tcp' } },
       { port: 3001, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID }], decryption: "none" }, streamSettings: { network: "tcp", security: "none" } },
-      { port: 3002, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID, level: 0 }], decryption: "none" }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/vless-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3003, listen: "127.0.0.1", protocol: "vmess", settings: { clients: [{ id: UUID, alterId: 0 }] }, streamSettings: { network: "ws", wsSettings: { path: "/vmess-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3004, listen: "127.0.0.1", protocol: "trojan", settings: { clients: [{ password: UUID }] }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/trojan-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
+      { port: 3002, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID, level: 0 }], decryption: "none" }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/vless-argo" } } },
+      { port: 3003, listen: "127.0.0.1", protocol: "vmess", settings: { clients: [{ id: UUID, alterId: 0 }] }, streamSettings: { network: "ws", wsSettings: { path: "/vmess-argo" } } },
+      { port: 3004, listen: "127.0.0.1", protocol: "trojan", settings: { clients: [{ password: UUID }] }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/trojan-argo" } } },
     ],
-    dns: { servers: ["https+local://8.8.8.8/dns-query"] },
-    outbounds: [{ protocol: "freedom", tag: "direct" }, { protocol: "blackhole", tag: "block" }]
+    dns: { servers: ["1.1.1.1", "8.8.8.8"], queryStrategy: "UseIPv4" },
+    policy: {
+      levels: { "0": { handshake: 4, connIdle: 300, uplinkOnly: 0, downlinkOnly: 0, bufferSize: 1024 } },
+      system: { statsInboundUplink: false, statsInboundDownlink: false, statsOutboundUplink: false, statsOutboundDownlink: false }
+    },
+    outbounds: [
+      { protocol: "freedom", tag: "direct", settings: { domainStrategy: "UseIPv4" } },
+      { protocol: "blackhole", tag: "block" }
+    ]
   };
   await fsp.writeFile(configPath, JSON.stringify(config, null, 2));
+}
+
+// 内核调优（BBR + 大 TCP 窗口）：容器内通常没有权限，静默失败不影响启动，有权限的宿主上直接生效
+async function tuneKernel() {
+  const cmd = [
+    'sysctl -w net.core.default_qdisc=fq || true',
+    'sysctl -w net.ipv4.tcp_congestion_control=bbr || true',
+    'sysctl -w net.ipv4.tcp_fastopen=3 || true',
+    'sysctl -w net.ipv4.tcp_window_scaling=1 || true',
+    'sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" || true',
+    'sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" || true',
+  ].join('; ');
+  try {
+    await exec(`${cmd} >/dev/null 2>&1`);
+    log('kernel tuning attempted');
+  } catch (error) {
+    // 无权限，忽略
+  }
 }
 
 // 判断系统架构
@@ -268,15 +299,15 @@ uuid: ${UUID}`;
     logErr(`web running error: ${error.message}`);
   }
 
-  // 运行cloudflared
+  // 运行cloudflared（quic 协议多路复用无队头阻塞，YouTube 高码率 / 多线程聚合吞吐收益最大）
   if (fs.existsSync(botPath)) {
     let args;
     if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-      args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}`;
+      args = `tunnel --edge-ip-version 4 --no-autoupdate --protocol ${ARGO_PROTOCOL} run --token ${ARGO_AUTH}`;
     } else if (ARGO_AUTH.match(/TunnelSecret/)) {
-      args = `tunnel --edge-ip-version auto --config ${FILE_PATH}/tunnel.yml run`;
+      args = `tunnel --edge-ip-version 4 --config ${FILE_PATH}/tunnel.yml run`;
     } else {
-      args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${FILE_PATH}/boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
+      args = `tunnel --edge-ip-version 4 --no-autoupdate --protocol ${ARGO_PROTOCOL} --logfile ${FILE_PATH}/boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
     }
 
     try {
@@ -318,7 +349,7 @@ function argoType() {
     const tunnelYaml = `
   tunnel: ${ARGO_AUTH.split('"')[11]}
   credentials-file: ${path.join(FILE_PATH, 'tunnel.json')}
-  protocol: http2
+  protocol: ${ARGO_PROTOCOL}
 
   ingress:
     - hostname: ${ARGO_DOMAIN}
@@ -354,7 +385,7 @@ async function extractDomains() {
     return;
   }
 
-  const tempArgs = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${FILE_PATH}/boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
+  const tempArgs = `tunnel --edge-ip-version 4 --no-autoupdate --protocol ${ARGO_PROTOCOL} --logfile ${FILE_PATH}/boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
 
   for (let attempt = 1; attempt <= MAX_ARGO_RETRIES; attempt++) {
     let argoDomain = null;
@@ -494,6 +525,7 @@ async function AddVisitTask() {
 // 主运行逻辑
 async function startserver() {
   try {
+    await tuneKernel();       // BBR + TCP 窗口调优（无权限则静默跳过）
     argoType();
     await deleteNodes();      // 先删订阅器上的旧节点（读 sub.txt 是同步完成的，必须在 cleanup 之前）
     await cleanupOldFiles();  // 再清空运行目录
